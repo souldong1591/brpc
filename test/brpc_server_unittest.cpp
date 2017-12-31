@@ -1,4 +1,4 @@
-// Baidu RPC - A framework to host and access services throughout Baidu.
+// brpc - A framework to host and access services throughout Baidu.
 // Copyright (c) 2014 Baidu, Inc.
 
 // Date: Sun Jul 13 15:04:18 CST 2014
@@ -8,7 +8,6 @@
 #include <sys/socket.h>
 #include <fstream>
 #include <gtest/gtest.h>
-#include <gperftools/profiler.h>
 #include <google/protobuf/descriptor.h>
 #include "butil/time.h"
 #include "butil/macros.h"
@@ -37,13 +36,13 @@
 #include "brpc/channel.h"
 #include "brpc/socket_map.h"
 #include "brpc/controller.h"
-#include "test/echo.pb.h"
-#include "test/v1.pb.h"
-#include "test/v2.pb.h"
+#include "echo.pb.h"
+#include "v1.pb.h"
+#include "v2.pb.h"
 
 int main(int argc, char* argv[]) {
     testing::InitGoogleTest(&argc, argv);
-    google::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
     return RUN_ALL_TESTS();
 }
 
@@ -165,6 +164,13 @@ TEST_F(ServerTest, sanity) {
         // accept hostname as well.
         ASSERT_EQ(0, server.Start("localhost:8613", NULL));
     }
+    {
+        brpc::Server server;
+        ASSERT_EQ(0, server.Start("localhost:0", NULL));
+        // port should be replaced with the actually used one.
+        ASSERT_NE(0, server.listen_address().port);
+    }
+
     {
         brpc::Server server;
         ASSERT_EQ(-1, server.Start(99999, NULL));
@@ -1003,7 +1009,7 @@ TEST_F(ServerTest, close_idle_connections) {
 
     const int cfd = tcp_connect(ep, NULL);
     ASSERT_GT(cfd, 0);
-    usleep(1000);
+    usleep(10000);
     brpc::ServerStatistics stat;
     server.GetStat(&stat);
     ASSERT_EQ(1ul, stat.connection_count);
@@ -1037,7 +1043,7 @@ TEST_F(ServerTest, logoff_and_multiple_start) {
         ASSERT_EQ(0, server.Stop(-1));
         ASSERT_EQ(0, server.Join());
         timer.stop();
-        EXPECT_TRUE(abs(timer.m_elapsed() - 100) < 10) << timer.m_elapsed();
+        EXPECT_TRUE(labs(timer.m_elapsed() - 100) < 10) << timer.m_elapsed();
         bthread_join(tid, NULL);
     }
 
@@ -1083,7 +1089,7 @@ TEST_F(ServerTest, logoff_and_multiple_start) {
         timer.stop();
         // Assertion will fail since EchoServiceImpl::Echo is holding
         // additional reference to the `Socket'
-        // EXPECT_TRUE(abs(timer.m_elapsed() - 50) < 10) << timer.m_elapsed();
+        // EXPECT_TRUE(labs(timer.m_elapsed() - 50) < 10) << timer.m_elapsed();
         bthread_join(tid, NULL);
     }
     
@@ -1103,7 +1109,7 @@ TEST_F(ServerTest, logoff_and_multiple_start) {
         ASSERT_EQ(0, server.Stop(1000));
         ASSERT_EQ(0, server.Join());
         timer.stop();
-        EXPECT_TRUE(abs(timer.m_elapsed() - 100) < 10) << timer.m_elapsed();
+        EXPECT_TRUE(labs(timer.m_elapsed() - 100) < 10) << timer.m_elapsed();
         bthread_join(tid, NULL);
     }
 }
@@ -1277,11 +1283,18 @@ TEST_F(ServerTest, too_big_message) {
     server.Join();
 }
 
-void CheckCert(const char* fname, const char* cert) {
-    butil::ScopedFILE fp(fname, "r");
-    char buf[1024];
-    fgets(buf, sizeof(buf), fp);
-    ASSERT_EQ(0, strncmp(cert, buf + 1, strlen(cert))) << cert; // Skip the first blank
+struct EchoOpensslMsg {};
+inline std::ostream& operator<<(std::ostream& os, EchoOpensslMsg) {
+    std::ifstream t("openssl.msg");
+    return os << "============ The output of previous openssl ============\n"
+              << t.rdbuf()
+              << "\n============ The output ends here ============\n";
+}
+void CheckCert(const char* cname, const char* cert) {
+    std::string cmd = butil::string_printf(
+        "echo 'Q' | openssl s_client -connect localhost:8613 "
+        "-servername %s > openssl.msg &&  grep %s openssl.msg", cname, cert);
+    ASSERT_EQ(0, system(cmd.c_str())) << EchoOpensslMsg();
 }
 
 std::string GetRawPemString(const char* fname) {
@@ -1311,20 +1324,12 @@ TEST_F(ServerTest, ssl_sni) {
          options.ssl_options.certs.push_back(cert);
      }
      ASSERT_EQ(0, server.Start(8613, &options));
-     {
-         std::string cmd = "/usr/bin/curl -Ikv https://localhost:8613 2>&1 "
-                 "| grep common | cut -d':' -f2 > cname.out";
-         ASSERT_EQ(0, system(cmd.c_str()));
-         CheckCert("cname.out", "cert1");
-     }
+     CheckCert("localhost", "cert1");
+
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
-     {
-         std::string cmd = "/usr/bin/curl -Ikv https://localhost.localdomain:8613 "
-                 "2>&1 | grep common | cut -d':' -f2 > cname.out";
-         ASSERT_EQ(0, system(cmd.c_str()));
-         CheckCert("cname.out", "cert2");
-     }
+     CheckCert("localhost.localdomain", "cert2");
 #endif  // SSL_CTRL_SET_TLSEXT_HOSTNAME
+     
      server.Stop(0);
      server.Join();
 }
@@ -1340,12 +1345,8 @@ TEST_F(ServerTest, ssl_reload) {
          options.ssl_options.default_cert = cert;
      }
      ASSERT_EQ(0, server.Start(8613, &options));
-     {
-         std::string cmd = "/usr/bin/curl -Ikv https://localhost:8613 2>&1 "
-                 "| grep common | cut -d':' -f2 > cname.out";
-         ASSERT_EQ(0, system(cmd.c_str()));
-         CheckCert("cname.out", "cert1");
-     }
+     CheckCert("localhost", "cert1");
+
      {
          brpc::CertInfo cert;
          cert.certificate = GetRawPemString("cert2.crt");
@@ -1354,12 +1355,7 @@ TEST_F(ServerTest, ssl_reload) {
          ASSERT_EQ(0, server.AddCertificate(cert));
      }
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
-     {
-         std::string cmd = "/usr/bin/curl -Ikv https://localhost.localdomain:8613 "
-                 "2>&1 | grep common | cut -d':' -f2 > cname.out";
-         ASSERT_EQ(0, system(cmd.c_str()));
-         CheckCert("cname.out", "cert2");
-     }
+    CheckCert("localhost.localdomain", "cert2");
 #endif  // SSL_CTRL_SET_TLSEXT_HOSTNAME
 
      {
@@ -1369,12 +1365,7 @@ TEST_F(ServerTest, ssl_reload) {
          ASSERT_EQ(0, server.RemoveCertificate(cert));
      }
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
-     {
-         std::string cmd = "/usr/bin/curl -Ikv https://localhost.localdomain:8613 "
-                 "2>&1 | grep common | cut -d':' -f2 > cname.out";
-         ASSERT_EQ(0, system(cmd.c_str()));
-         CheckCert("cname.out", "cert1");
-     }
+     CheckCert("localhost.localdomain", "cert1");
 #endif  // SSL_CTRL_SET_TLSEXT_HOSTNAME
 
      {
@@ -1387,12 +1378,7 @@ TEST_F(ServerTest, ssl_reload) {
          ASSERT_EQ(0, server.ResetCertificates(certs));
      }
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
-     {
-         std::string cmd = "/usr/bin/curl -Ikv https://localhost.localdomain:8613 "
-                 "2>&1 | grep common | cut -d':' -f2 > cname.out";
-         ASSERT_EQ(0, system(cmd.c_str()));
-         CheckCert("cname.out", "cert2");
-     }
+     CheckCert("localhost.localdomain", "cert2");
 #endif  // SSL_CTRL_SET_TLSEXT_HOSTNAME
 
      server.Stop(0);
